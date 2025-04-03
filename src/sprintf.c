@@ -11,14 +11,17 @@ typedef struct _msgpack_sprintf_context
 {
     msgpack_packer *pk; // msgpack_packer object used to write
     msgpack_sbuffer *sb;    // msgpack_packer data is sbuf object .. used as backup
+    va_list         ap;
 
     int flags;  // is an array or a map?
-    int size;   // size reflects sb->size when the function is called
+    size_t size;   // size reflects sb->size when the function is called
 } msgpack_sprintf_context;
 
+typedef void (*msgpack_sprintf_callback)(msgpack_packer *pack, void *opt);
+
 // msgpack can call itself as recursive
-static const char *msgpack_sprintf_map(msgpack_sprintf_context *ctx, const char *fmt, va_list args);
-static const char *msgpack_sprintf_array(msgpack_sprintf_context *ctx, const char *fmt, va_list args);
+static const char *msgpack_sprintf_map(msgpack_sprintf_context *ctx, const char *fmt);
+static const char *msgpack_sprintf_array(msgpack_sprintf_context *ctx, const char *fmt);
 
 /**
  * get_token parse the input string to find the initial sequence of a token
@@ -56,19 +59,16 @@ static const char *get_token(const char *src, const char **end)
     return start;
 }
 
-// encode a string taken from variadic
-static void msgpack_sprintf_pack_str(msgpack_packer *pk, va_list args)
+/// @brief copy from src all buffer to dst
+/// @param dst 
+/// @param src 
+static void msgpack_sprintf_bulk(msgpack_packer *dst, msgpack_packer *src)
 {
-    const char *in = va_arg(args, const char *);
-    size_t size = 0;
+    msgpack_sbuffer *sbuf_dst = (msgpack_sbuffer *)dst->data;
+    msgpack_sbuffer *sbuf_src = (msgpack_sbuffer *)src->data;
 
-    if (in != NULL)
-    {
-        size = strlen(in);
-    }
-    msgpack_pack_str_with_body(pk, in, size);
+    msgpack_sbuffer_write(dst->data, sbuf_src->data, sbuf_src->size);
 }
-
 /**
  * parse the element after '%' and
  * @param pk
@@ -76,15 +76,18 @@ static void msgpack_sprintf_pack_str(msgpack_packer *pk, va_list args)
  * @param args
  * @return
  */
-static const char* msgpack_sprintf_pack_arg(msgpack_packer *pk, const char *fmt, va_list args)
+static const char* msgpack_sprintf_pack_arg(msgpack_packer *pk, const char *fmt, va_list *args)
 {
     uint32_t u32;
     void *ptr;
+    msgpack_sprintf_callback callback;
+    msgpack_packer new_pk;
+    msgpack_sbuffer sbuf;
 
     switch(*fmt)
     {
         case 's':
-            ptr = va_arg(args, void *);
+            ptr = va_arg(*args, void *);
             if (ptr == NULL)
                 msgpack_pack_nil(pk);
             else
@@ -93,23 +96,23 @@ static const char* msgpack_sprintf_pack_arg(msgpack_packer *pk, const char *fmt,
         case 'S': // not yet supported;
             break;
         case 'c':
-            u32 = va_arg(args, uint32_t);
+            u32 = va_arg(*args, uint32_t);
             msgpack_pack_str_with_body(pk, &u32, 1);
             break;
         case 'n': // null pointer
-            va_arg(args, void *); // ignore
+            va_arg(*args, void *); // ignore
             msgpack_pack_nil(pk);
             break;
         case 'b': // boolean
-            u32 = va_arg(args, uint32_t);
+            u32 = va_arg(*args, uint32_t);
             if (u32)
                 msgpack_pack_true(pk);
             else
                 msgpack_pack_false(pk);
             break;
         case 'p': // binary 8/16/32
-            ptr = va_arg(args, void *); // fetch pointer
-            u32 = va_arg(args, uint32_t);   // fetch size
+            ptr = va_arg(*args, void *); // fetch pointer
+            u32 = va_arg(*args, uint32_t);   // fetch size
             msgpack_pack_bin_with_body(pk, ptr, u32);
             break;
         case 'f': // float
@@ -117,30 +120,44 @@ static const char* msgpack_sprintf_pack_arg(msgpack_packer *pk, const char *fmt,
         case 'e': // float64
             break;
         case 'i': //int
-            u32 = va_arg(args, uint32_t);
+            u32 = va_arg(*args, uint32_t);
             msgpack_pack_int(pk, (int)u32);
             break;
         case 'u': //uint
-            u32 = va_arg(args, uint32_t);
-            msgpack_pack_unsigned_int(args, u32);
+            u32 = va_arg(*args, uint32_t);
+            msgpack_pack_unsigned_int(pk, u32);
             break;
         case '!': // callback
+            callback = va_arg(*args, msgpack_sprintf_callback);
+            ptr = va_arg(*args, void *);
+            msgpack_sbuffer_init(&sbuf);
+            msgpack_packer_init(&new_pk, &sbuf, msgpack_sbuffer_write);
+            
+            callback(&new_pk, ptr);
+
+            // bulk copy
+            msgpack_sprintf_bulk(pk, &new_pk);
+            msgpack_sbuffer_free(&sbuf);
             break;
+
     }
+
+    return fmt;
 }
 
 /* create an array in msgpack */
-static const char *msgpack_sprintf_array(msgpack_sprintf_context *ctx, const char *fmt, va_list args)
+static const char *msgpack_sprintf_array(msgpack_sprintf_context *ctx, const char *fmt)
 {
-    ssize_t array_size = -1;
+    int32_t array_size = -1;
     msgpack_packer *pk = ctx->pk;
 
     msgpack_sprintf_context tmp;
     tmp.flags = 0;
     tmp.pk = pk;
+    tmp.ap = ctx->ap;
     tmp.size = ctx->sb->size;
     tmp.sb = ctx->sb;
-
+    
     msgpack_pack_array(ctx->pk, 0x65537); // force msgpack to write a array32
 
     for(; *fmt != '\0' || *fmt != ']'; ++fmt)
@@ -152,19 +169,23 @@ static const char *msgpack_sprintf_array(msgpack_sprintf_context *ctx, const cha
             case ',':
                 break;
             case '%': ++fmt;
-              fmt = msgpack_sprintf_pack_arg(ctx->pk, fmt, args);
+                fmt = msgpack_sprintf_pack_arg(tmp.pk, fmt, &tmp.ap);
+                ++array_size;
                 break;
             case '{': // consume a map
-                fmt = msgpack_sprintf_map(ctx, fmt++, args);
+                fmt = msgpack_sprintf_map(&tmp, fmt++);
+                ++array_size;
                 break;
             case '[': // consume an array
-                fmt = msgpack_sprintf_array(ctx, fmt++, args);
+                fmt = msgpack_sprintf_array(&tmp, fmt++);
+                ++array_size;
                 break;
             default:
                 break;
         }
     }
 
+    ctx->ap = tmp.ap;
     if (array_size >= 0)  // we have a valid size.. so we can adjust the buffer
     {
         size_t data_off = tmp.size + 5;
@@ -172,7 +193,7 @@ static const char *msgpack_sprintf_array(msgpack_sprintf_context *ctx, const cha
 
         ctx->sb->size = tmp.size;   // reset the pointer
 
-        msgpack_pack_map(ctx->sb, array_size);    // write the right size
+        msgpack_pack_map(ctx->pk, array_size);    // write the right size
         memcpy(ctx->sb->data + ctx->sb->size, ctx->sb->data + data_off, data_len);  // transfer the bytes
     }
     else
@@ -187,7 +208,7 @@ static const char *msgpack_sprintf_array(msgpack_sprintf_context *ctx, const cha
 }
 
 /* create a map in msgpack */
-static const char *msgpack_sprintf_map(msgpack_sprintf_context *ctx, const char *fmt, va_list args)
+static const char *msgpack_sprintf_map(msgpack_sprintf_context *ctx, const char *fmt)
 {
     msgpack_packer *pk = ctx->pk;
 
@@ -196,10 +217,11 @@ static const char *msgpack_sprintf_map(msgpack_sprintf_context *ctx, const char 
     tmp.pk = pk;
     tmp.size = ctx->sb->size;
     tmp.sb = ctx->sb;
+    tmp.ap = ctx->ap;
 
     msgpack_pack_map(ctx->pk, 0x65537); // force msgpack to write a map32
 
-    ssize_t map_size = -1;
+    int32_t map_size = -1;
 
     for(; *fmt != '\0' || *fmt != '}'; ++fmt)
     {
@@ -226,7 +248,18 @@ static const char *msgpack_sprintf_map(msgpack_sprintf_context *ctx, const char 
                     break;
                 case '%':
                     ++fmt;
-                    fmt = msgpack_sprintf_pack_arg(&tmp, fmt, args);
+                    fmt = msgpack_sprintf_pack_arg(tmp.pk, fmt, &tmp.ap);
+                    done = true;
+                    ++map_size;
+                    break;
+                case '{':
+                    fmt = msgpack_sprintf_map(&tmp, fmt++);
+                    ++map_size;
+                    done = true;
+                    break;
+                case '[':
+                    fmt = msgpack_sprintf_array(&tmp, fmt++);
+                    ++map_size;
                     done = true;
                     break;
                 default:
@@ -236,6 +269,8 @@ static const char *msgpack_sprintf_map(msgpack_sprintf_context *ctx, const char 
         } while(done);
     }
 
+    ctx->ap = tmp.ap;
+
     if (map_size >= 0)  // we have a valid size.. so we can adjust the buffer
     {
         size_t data_off = tmp.size + 5;
@@ -243,7 +278,7 @@ static const char *msgpack_sprintf_map(msgpack_sprintf_context *ctx, const char 
 
         ctx->sb->size = tmp.size;   // reset the pointer
 
-        msgpack_pack_map(ctx->sb, map_size);    // write the right size
+        msgpack_pack_map(ctx->pk, map_size);    // write the right size
         memcpy(ctx->sb->data + ctx->sb->size, ctx->sb->data + data_off, data_len);  // transfer the bytes
     }
     else
@@ -258,25 +293,25 @@ static const char *msgpack_sprintf_map(msgpack_sprintf_context *ctx, const char 
 
 int msgpack_sprintf(msgpack_packer* pk, const char *fmt, ...)
 {
-    va_list args;
     msgpack_sprintf_context ctx;
 
     ctx.pk = pk;
     ctx.size = 0;
     ctx.flags = 0;
     ctx.sb = (msgpack_sbuffer *) pk->data;  // to improve map/array serialization, I need to rewrite data structure
+    va_start(ctx.ap, fmt);
 
-    for(va_start(args, fmt); *fmt != '\0'; ++fmt)
+    for(; *fmt != '\0'; ++fmt)
     {
         switch(*fmt)
         {
             case '[':
                 ctx.flags = MSGPACK_SPRINTF_PACK_ARRAY;
-                fmt = msgpack_sprintf_array(pk, fmt++, args);
+                fmt = msgpack_sprintf_array(&ctx, fmt++);
                 break;
             case '{':
                 ctx.flags = MSGPACK_SPRINTF_PACK_MAP;
-                fmt = msgpack_sprintf_map(pk, fmt++, args);
+                fmt = msgpack_sprintf_map(&ctx, fmt++);
                 break;
             case ' ':
                 break;

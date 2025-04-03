@@ -3,17 +3,20 @@ A sprintf function to create msgpack objects
 
 This repository contains some simple code, to allows c/c++ developers to create msgpack objects (map and array) using same syntax of printf/sprintf/scanf function.ù
 
+## msgpack-c
+This source code is based on [msgpack-c](https://github.com/msgpack/msgpack-c/tree/c_master) source code. Until this project is under development, the original source code is duplicated into this repo to allow test/development. The modified files are:
+- Files.cmake: Added src/sprintf.c
+- include/msgpack.h - Added the msgpack_sprintf function declaration
+
 ```c
 int msgpack_sprintf(msgpack_packer *pack, const char *fmt, ...);
 ```
 
 Parameters:
-
-The function accepts the following parameters:
 - pack: A msgpack_packer struct, initialized through msgpack_packer_new
-- fmt: A pointer to a null-terminated string that contains the text of msgpack to write in pack object. See fmt syntax section for more informations.
+- fmt: A pointer to a null-terminated string that contains the text of msgpack to write in pack object. See fmt syntax section for more Information.
 
-To simplify the creation of objects, and to improve code readibility, keys in map can be hardcoded with/without double quotes, and immediate values as integer, strings and some symbols are accepted.
+To simplify the creation of objects, and to improve code readability, keys in map can be hardcoded with/without double quotes, and immediate values as integer, strings and some symbols are accepted.
 
 ## fmt syntax
 MsgPack supports object serialization like JSON.
@@ -44,7 +47,7 @@ Note: Not specifiers are supported, due binary serialization in msgpack
 | %e           | 1+8  | float64        | Store a double value |
 | %i           | 1..9 | int8..int64    | Store an integer value, from 8 bit to 64bit |
 | %u           | 1..9 | UINT8..UINT64  | Store an unsigned integer value, from 8 to 64 bit. |
-| %!           | 1..n |                | A place holder used to populate elements through a callback function |
+| %!           | 1..n |                | A place holder used to fill an object through a callback function |
 | null         | 1    | nil            | write nil as value |
 | key          | 1..n | fixstr...      | write a key as string |
 
@@ -66,19 +69,24 @@ msgpack_sprintf(out, "{key: %s, buffer: %p}", "value",
 /* Create an object with a custom value */
 int custom_element(msgpack_packer *pack, void *opt)
 {
-  msgpack_sprintf("[%i]", 1);
+  msgpack_sprintf(pack, "[%i]", 1);
   return 0;
 }
 
 int recursive_element(msgpack_packer *pack, void *opt)
 {
-  msgpack_sprintf("%i", 1);
+  msgpack_sprintf(pack, "%i", 1);
   int *r = (int *) opt;
   *r--;
   return *r != 0;
 }
 
 msgpack_sprintf(out, "{key: %!}", custom_element, NULL);
+
+/** Deprecated format
 msgpack_sprintf(out, "{key: [%!]}", recursive_element, (void *) 4); // call recursive_element until the function returns 0
+ **/
 ```
 
+## Array Recursive Expansion
+To allow format for `%!` and to keep simple logic (until the internal parsing will be improved) the recursion must be used only to generate array or map, so I discourage the use of inline array expansion because msgpack_sprintf at top level evaluate an array or a map.
