@@ -12,3 +12,7 @@ _deps
 CMakeUserPresets.json
 build/*
 cmake-build-debug/*
+.DS_Store
+.idea
+[Bb]in/*
+[Oo]bj/*
