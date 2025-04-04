@@ -83,6 +83,61 @@ static const char *get_token(const char *src, const char **end)
     return start;
 }
 
+static const char *move_next_token(const char *fmt)
+{
+    if (fmt != NULL)
+    {
+        for(; *fmt != 0; ++fmt)
+        {
+            if (*fmt == '[' || *fmt == ']')
+                break;
+            if (*fmt == '{' || *fmt == '}')
+                break;
+            if (*fmt == ' ')
+                break;
+            if (*fmt == ',')
+                break;
+
+            if (*fmt == '%')
+                break;
+        }
+    }
+
+    return fmt;
+}
+/// @brief write a default value (true, false, nil) in case fmt contains a specific keyword
+/// @param pk msgpack destination object
+/// @param fmt current position of fmt
+/// @return 0 found keyword, or non zero
+static int default_keywords(msgpack_packer *pk, const char *fmt)
+{
+    int valid = 0;
+    switch(*fmt)
+    {
+    case 'f':
+    if (strlen(fmt) >= 5 && memcmp(fmt, "false", 5) == 0)
+    {
+        msgpack_pack_false(pk);
+        valid = 1;
+    }
+    break;
+case 't':
+    if (strlen(fmt) >= 4 && memcmp(fmt, "true", 4) == 0)
+    {
+        msgpack_pack_true(pk);
+        valid = 1;
+    }
+    break;
+case 'n':
+    if (strlen(fmt) >= 3 && (memcmp(fmt, "null", 4) == 0 || memcmp(fmt, "nil", 3) == 0))
+    {
+        msgpack_pack_nil(pk);
+        valid = 1;
+    }
+    }
+
+    return !valid;
+}
 /// @brief copy from src all buffer to dst
 /// @param dst 
 /// @param src 
@@ -246,6 +301,11 @@ static const char *msgpack_sprintf_array(msgpack_sprintf_context *ctx, const cha
                 ++array_size;
                 break;
             default:
+                if (default_keywords(tmp.pk, fmt) == 0)
+                {
+                    ++array_size;
+                    fmt = move_next_token(fmt);
+                }
                 break;
         }
     }
@@ -302,7 +362,7 @@ static const char *msgpack_sprintf_map(msgpack_sprintf_context *ctx, const char 
         msgpack_pack_str_with_body(ctx->pk, token_start, token_length); // write the key
         fmt = token_end;
 
-        bool done = false;
+        int done = 0;
         do
         {
             switch (*fmt) {
@@ -314,24 +374,30 @@ static const char *msgpack_sprintf_map(msgpack_sprintf_context *ctx, const char 
                 case '%':
                     ++fmt;
                     fmt = msgpack_sprintf_pack_arg(tmp.pk, fmt, &tmp.ap);
-                    done = true;
+                    done = 1;
                     ++map_size;
                     break;
                 case '{':
                     fmt = msgpack_sprintf_map(&tmp, fmt++);
                     ++map_size;
-                    done = true;
+                    done = 1;
                     break;
                 case '[':
                     fmt = msgpack_sprintf_array(&tmp, fmt++);
                     ++map_size;
-                    done = true;
+                    done = 1;
                     break;
                 default:
+                    if (default_keywords(tmp.pk, fmt) == 0)
+                    {
+                        fmt = move_next_token(fmt);
+                        ++map_size;
+                        done = 1;
+                    }
                     break;
             }
             ++fmt;
-        } while(done);
+        } while(done == 0);
     }
 
     ctx->ap = tmp.ap;
