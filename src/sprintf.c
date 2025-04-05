@@ -3,9 +3,6 @@
 #include <stdio.h>
 #include <msgpack.h>
 
-#define MSGPACK_SPRINTF_PACK_MAP    1
-#define MSGPACK_SPRINTF_PACK_ARRAY  2
-
 // due msgpack nature.. it holds some data before finalize the object
 typedef struct _msgpack_sprintf_context
 {
@@ -18,10 +15,6 @@ typedef struct _msgpack_sprintf_context
 } msgpack_sprintf_context;
 
 typedef void (*msgpack_sprintf_callback)(msgpack_packer *pack, void *opt);
-
-// msgpack can call itself as recursive
-static const char *msgpack_sprintf_map(msgpack_sprintf_context *ctx, const char *fmt);
-static const char *msgpack_sprintf_array(msgpack_sprintf_context *ctx, const char *fmt);
 
 // based on Martin Kallaman float32 https://gist.github.com/martin-kallman/5049614
 // source code from Alex Zhukov https://gist.github.com/zhuker/b4bd1fb306c7b04975b712c37c4c4075
@@ -47,6 +40,32 @@ static void hf_to_float32(float *out, const uint16_t in)
     *((uint32_t *) out) = t1;
 };
 
+
+/// <summary>
+/// find the next token
+/// </summary>
+/// <param name="fmt">string</param>
+/// <returns>pointer to next token or NULL</returns>
+static const char* move_next_token(const char* fmt)
+{
+    if (fmt != NULL)
+    {
+        for (; *fmt != 0; ++fmt)
+        {
+            if (*fmt == ' ')
+                continue;
+            if (*fmt == ',')
+                continue;
+            if (*fmt == ':')
+                continue;
+            break;
+        }
+        if (*fmt == 0)
+            return NULL;
+    }
+
+    return fmt;
+}
 /**
  * get_token parse the input string to find the initial sequence of a token
  * like ' aKey:' '  anotherKey'.
@@ -56,55 +75,35 @@ static void hf_to_float32(float *out, const uint16_t in)
  */
 static const char *get_token(const char *src, const char **end)
 {
-    const char *start = NULL;
+    const char* start = move_next_token(src);
+
     *end = NULL;
 
-    for(; *src != '\0'; ++src)
+    if (start == NULL)
     {
-        if (*src == ' ' && start == NULL)   // space.. ignore
-            continue;
-        if (*src == ':' && start == NULL)   // colon.. no start.. ERROR!
-            break;
-        
-        if (*src == ' ' && start != NULL)
-            break;
-        if (*src == ':' && start != NULL)
-            break;
-        
-        if (!start)
-            start = src;
+        return NULL;
     }
 
-    if (start != NULL)
+    for(src = start; *src != '\0'; ++src)
     {
-        *end = src;
+        if (*src == ' ')
+            break;
+        if (*src == ':')
+            break;
+        if (*src == '[')
+            break;
+        if (*src == '{')
+            break;
     }
+    
+    *end = src;
+    
+    if (*src == '\0')
+        return NULL;
 
     return start;
 }
 
-static const char *move_next_token(const char *fmt)
-{
-    if (fmt != NULL)
-    {
-        for(; *fmt != 0; ++fmt)
-        {
-            if (*fmt == '[' || *fmt == ']')
-                break;
-            if (*fmt == '{' || *fmt == '}')
-                break;
-            if (*fmt == ' ')
-                break;
-            if (*fmt == ',')
-                break;
-
-            if (*fmt == '%')
-                break;
-        }
-    }
-
-    return fmt;
-}
 /// @brief write a default value (true, false, nil) in case fmt contains a specific keyword
 /// @param pk msgpack destination object
 /// @param fmt current position of fmt
@@ -169,6 +168,7 @@ static const char* msgpack_sprintf_pack_arg(msgpack_packer *pk, const char *fmt,
 
     do
     {
+        fmt++;
         switch(*fmt)
         {
             case 'h': half = 1; // half prefix
@@ -237,8 +237,9 @@ static const char* msgpack_sprintf_pack_arg(msgpack_packer *pk, const char *fmt,
                 if (half)
                     i32 = (int32_t)(va_arg(*ap, int16_t));
                 else
-                    i32 = va_arg(*ap, uint32_t);
+                    i32 = va_arg(*ap, int);
                 msgpack_pack_int(pk, (int)i32);
+                half = 0;
                 break;
             case 'u': //uint
                 if (half)
@@ -246,6 +247,7 @@ static const char* msgpack_sprintf_pack_arg(msgpack_packer *pk, const char *fmt,
                 else
                     u32 = va_arg(*ap, uint32_t);
                 msgpack_pack_unsigned_int(pk, u32);
+                half = 0;
                 break;
             case '!': // callback
                 callback = va_arg(*ap, msgpack_sprintf_callback);
@@ -259,82 +261,16 @@ static const char* msgpack_sprintf_pack_arg(msgpack_packer *pk, const char *fmt,
                 msgpack_sbuffer_free(&sbuf);
                 break;
         }
-        ++fmt;
     } while(half != 0);
 
     return fmt;
 }
 
-/* create an array in msgpack */
-static const char *msgpack_sprintf_array(msgpack_sprintf_context *ctx, const char *fmt)
-{
-    int32_t array_size = -1;
-    msgpack_packer *pk = ctx->pk;
-
-    msgpack_sprintf_context tmp;
-    tmp.flags = 0;
-    tmp.pk = pk;
-    tmp.ap = ctx->ap;
-    tmp.size = ctx->sb->size;
-    tmp.sb = ctx->sb;
-    
-    msgpack_pack_array(ctx->pk, 0x65537); // force msgpack to write a array32
-
-    for(; *fmt != '\0' || *fmt != ']'; ++fmt)
-    {
-        switch(*fmt)
-        {
-            // ignore character
-            case ' ':
-            case ',':
-                break;
-            case '%': ++fmt;
-                fmt = msgpack_sprintf_pack_arg(tmp.pk, fmt, &tmp.ap);
-                ++array_size;
-                break;
-            case '{': // consume a map
-                fmt = msgpack_sprintf_map(&tmp, fmt++);
-                ++array_size;
-                break;
-            case '[': // consume an array
-                fmt = msgpack_sprintf_array(&tmp, fmt++);
-                ++array_size;
-                break;
-            default:
-                if (default_keywords(tmp.pk, fmt) == 0)
-                {
-                    ++array_size;
-                    fmt = move_next_token(fmt);
-                }
-                break;
-        }
-    }
-
-    ctx->ap = tmp.ap;
-    if (array_size >= 0)  // we have a valid size.. so we can adjust the buffer
-    {
-        size_t data_off = tmp.size + 5;
-        size_t data_len = ctx->sb->size - tmp.size + 5;
-
-        ctx->sb->size = tmp.size;   // reset the pointer
-
-        msgpack_pack_map(ctx->pk, array_size);    // write the right size
-        memcpy(ctx->sb->data + ctx->sb->size, ctx->sb->data + data_off, data_len);  // transfer the bytes
-    }
-    else
-    {   // an error has been detected parsing elements.. the full sequence will be destroyed
-        size_t clear_off = ctx->sb->size;
-        ctx->sb->size = tmp.size;
-
-        memset(ctx->sb->data + ctx->sb->size, 0, clear_off - tmp.size);
-    }
-
-    return fmt;
-}
-
 /* create a map in msgpack */
-static const char *msgpack_sprintf_map(msgpack_sprintf_context *ctx, const char *fmt)
+static const char *msgpack_sprintf_obj(msgpack_sprintf_context *ctx, const char *fmt)
 {
+    const char* next_token;
+
     msgpack_packer *pk = ctx->pk;
 
     msgpack_sprintf_context tmp;
@@ -344,73 +280,88 @@ static const char *msgpack_sprintf_map(msgpack_sprintf_context *ctx, const char 
     tmp.sb = ctx->sb;
     tmp.ap = ctx->ap;
 
-    msgpack_pack_map(ctx->pk, 0x65537); // force msgpack to write a map32
+    if (ctx->flags == MSGPACK_OBJECT_MAP)
+        msgpack_pack_map(ctx->pk, 65537); // force msgpack to write a map32
+    else
+        msgpack_pack_array(ctx->pk, 65537);
 
-    int32_t map_size = -1;
+    int32_t object_size = 0;
 
-    for(; *fmt != '\0' || *fmt != '}'; ++fmt)
+    char sequence_terminator = (ctx->flags == MSGPACK_OBJECT_ARRAY) ? ']' : '}';
+
+    for(; fmt != NULL && *fmt != '\0' && *fmt != sequence_terminator; ++fmt)
     {
-        // fetch the key.. then fetch a value
-        const char *token_start = NULL, *token_end = NULL;
-        token_start = get_token(fmt, &token_end);
+        if (ctx->flags == MSGPACK_OBJECT_MAP)
+        {
+            // fetch the key.. then fetch a value
+            const char* token_start = NULL, * token_end = NULL;
+            token_start = get_token(fmt, &token_end);
 
-        if (token_start == NULL || token_end == NULL)
-            break;
+            if (token_start == NULL || token_end == NULL)
+                break;
 
-        size_t token_length = token_end - token_start;
+            size_t token_length = token_end - token_start;
 
-        msgpack_pack_str_with_body(ctx->pk, token_start, token_length); // write the key
-        fmt = token_end;
+            msgpack_pack_str_with_body(ctx->pk, token_start, token_length); // write the key
+            fmt = token_end;
+        }
 
         int done = 0;
         do
         {
+            fmt = move_next_token(fmt);
+            if (!fmt)
+                break;
+
             switch (*fmt) {
                 // ignore character
-                case ':':
-                case ' ':
-                case ',':
-                    break;
                 case '%':
-                    ++fmt;
                     fmt = msgpack_sprintf_pack_arg(tmp.pk, fmt, &tmp.ap);
                     done = 1;
-                    ++map_size;
+                    ++object_size;
                     break;
                 case '{':
-                    fmt = msgpack_sprintf_map(&tmp, fmt++);
-                    ++map_size;
+                    tmp.flags = MSGPACK_OBJECT_MAP;
+                    next_token = move_next_token(fmt);
+                    fmt = msgpack_sprintf_obj(&tmp, ++next_token);
+                    ++object_size;
                     done = 1;
                     break;
                 case '[':
-                    fmt = msgpack_sprintf_array(&tmp, fmt++);
-                    ++map_size;
+                    tmp.flags = MSGPACK_OBJECT_ARRAY;
+                    next_token = move_next_token(fmt);
+                    fmt = msgpack_sprintf_obj(&tmp, ++next_token);
+                    ++object_size;
                     done = 1;
                     break;
                 default:
                     if (default_keywords(tmp.pk, fmt) == 0)
                     {
                         fmt = move_next_token(fmt);
-                        ++map_size;
+                        ++object_size;
                         done = 1;
                     }
                     break;
             }
-            ++fmt;
         } while(done == 0);
     }
 
     ctx->ap = tmp.ap;
 
-    if (map_size >= 0)  // we have a valid size.. so we can adjust the buffer
+    if (object_size >= 0)  // we have a valid size.. so we can adjust the buffer
     {
         size_t data_off = tmp.size + 5;
-        size_t data_len = ctx->sb->size - tmp.size + 5;
+        size_t data_len = ctx->sb->size - tmp.size - 5;
 
         ctx->sb->size = tmp.size;   // reset the pointer
 
-        msgpack_pack_map(ctx->pk, map_size);    // write the right size
+        if (ctx->flags == MSGPACK_OBJECT_MAP)
+            msgpack_pack_map(ctx->pk, object_size);    // write the right size
+        else
+            msgpack_pack_array(ctx->pk, object_size);
+
         memcpy(ctx->sb->data + ctx->sb->size, ctx->sb->data + data_off, data_len);  // transfer the bytes
+        ctx->sb->size += data_len;
     }
     else
     {   // an error has been detected parsing elements.. the full sequence will be destroyed
@@ -437,12 +388,12 @@ int msgpack_sprintf(msgpack_packer* pk, const char *fmt, ...)
         switch(*fmt)
         {
             case '[':
-                ctx.flags = MSGPACK_SPRINTF_PACK_ARRAY;
-                fmt = msgpack_sprintf_array(&ctx, fmt++);
+                ctx.flags = MSGPACK_OBJECT_ARRAY;
+                fmt = msgpack_sprintf_obj(&ctx, ++fmt);
                 break;
             case '{':
-                ctx.flags = MSGPACK_SPRINTF_PACK_MAP;
-                fmt = msgpack_sprintf_map(&ctx, fmt++);
+                ctx.flags = MSGPACK_OBJECT_MAP;
+                fmt = msgpack_sprintf_obj(&ctx, ++fmt);
                 break;
             case ' ':
                 break;
