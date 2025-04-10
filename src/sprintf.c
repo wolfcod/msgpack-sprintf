@@ -14,7 +14,7 @@ typedef struct _msgpack_sprintf_context
     size_t size;   // size reflects sb->size when the function is called
 } msgpack_sprintf_context;
 
-typedef void (*msgpack_sprintf_callback)(msgpack_packer *pack, void *opt);
+typedef int (*msgpack_sprintf_callback)(msgpack_packer *pack, void *opt);
 
 // based on Martin Kallaman float32 https://gist.github.com/martin-kallman/5049614
 // source code from Alex Zhukov https://gist.github.com/zhuker/b4bd1fb306c7b04975b712c37c4c4075
@@ -147,6 +147,7 @@ static void msgpack_sprintf_bulk(msgpack_packer *dst, msgpack_packer *src)
 
     msgpack_sbuffer_write(dst->data, sbuf_src->data, sbuf_src->size);
 }
+
 /**
  * parse the element after '%' and
  * @param pk
@@ -165,6 +166,7 @@ static const char* msgpack_sprintf_pack_arg(msgpack_packer *pk, const char *fmt,
     msgpack_packer new_pk;
     msgpack_sbuffer sbuf;
     uint8_t half = 0;
+    int loop_done;
 
     do
     {
@@ -232,6 +234,7 @@ static const char* msgpack_sprintf_pack_arg(msgpack_packer *pk, const char *fmt,
                     f64 = va_arg(*ap, double);
                     msgpack_pack_double(pk, f64);
                 }
+                half = 0;
                 break;
             case 'i': //int
                 if (half)
@@ -249,16 +252,17 @@ static const char* msgpack_sprintf_pack_arg(msgpack_packer *pk, const char *fmt,
                 msgpack_pack_unsigned_int(pk, u32);
                 half = 0;
                 break;
-            case '!': // callback
+            case '!': // callback.. in this case it should be a map.. so just a nested object without being recursive
                 callback = va_arg(*ap, msgpack_sprintf_callback);
-                ptr = va_arg(*ap, void *);
+                ptr = va_arg(*ap, void*);
                 msgpack_sbuffer_init(&sbuf);
                 msgpack_packer_init(&new_pk, &sbuf, msgpack_sbuffer_write);
-                
+
                 callback(&new_pk, ptr);
 
                 msgpack_sprintf_bulk(pk, &new_pk);
-                msgpack_sbuffer_free(&sbuf);
+                msgpack_sbuffer_destroy(&sbuf);
+                half = 0;
                 break;
         }
     } while(half != 0);
@@ -269,6 +273,11 @@ static const char* msgpack_sprintf_pack_arg(msgpack_packer *pk, const char *fmt,
 /* create a map in msgpack */
 static const char *msgpack_sprintf_obj(msgpack_sprintf_context *ctx, const char *fmt)
 {
+    void* ptr;
+    msgpack_sprintf_callback callback;
+    msgpack_packer new_pk;
+    msgpack_sbuffer sbuf;
+
     const char* next_token;
 
     msgpack_packer *pk = ctx->pk;
@@ -306,6 +315,7 @@ static const char *msgpack_sprintf_obj(msgpack_sprintf_context *ctx, const char 
             fmt = token_end;
         }
 
+        int r = 0;
         int done = 0;
         do
         {
@@ -316,9 +326,30 @@ static const char *msgpack_sprintf_obj(msgpack_sprintf_context *ctx, const char 
             switch (*fmt) {
                 // ignore character
                 case '%':
-                    fmt = msgpack_sprintf_pack_arg(tmp.pk, fmt, &tmp.ap);
-                    done = 1;
-                    ++object_size;
+                    if (fmt[1] == '!' && ctx->flags == MSGPACK_OBJECT_ARRAY)
+                    {
+                        callback = va_arg(tmp.ap, msgpack_sprintf_callback);
+                        ptr = va_arg(tmp.ap, void*);
+                        msgpack_sbuffer_init(&sbuf);
+                        msgpack_packer_init(&new_pk, &sbuf, msgpack_sbuffer_write);
+
+                        do
+                        {
+                            r = callback(&new_pk, ptr);
+                            ++object_size;
+                        } while (r != 0);
+
+                        msgpack_sprintf_bulk(pk, &new_pk);
+                        msgpack_sbuffer_destroy(&sbuf);
+                        done = 1;
+                        fmt++;
+                    }
+                    else
+                    {
+                        fmt = msgpack_sprintf_pack_arg(tmp.pk, fmt, &tmp.ap);
+                        done = 1;
+                        ++object_size;
+                    }
                     break;
                 case '{':
                     tmp.flags = MSGPACK_OBJECT_MAP;

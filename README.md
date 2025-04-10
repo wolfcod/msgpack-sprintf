@@ -1,4 +1,4 @@
-# msgpack_sprintf
+# msgpack-sprintf
 A sprintf function to create msgpack objects, using the printf syntax with some changes to be compatible with JSON syntax.
 
 This repository contains some simple code, to allows c/c++ developers to create msgpack objects (map and array) using same syntax of printf/sprintf/scanf function.
@@ -29,7 +29,7 @@ Symbols and place-holder adopted internally for fmt syntax.
 |--------------|------|----------------|-------------|--------|
 | { }          | 1..n | map            | Create a map that supports from 0 to 2^32-1 objects | See Note 1 |
 | [ ]          | 1..n | array          | Create an array of objects that supports from 0 to 2^32'-1 elements | OK |
-| %c           | 1    | fixstr [1]     | Store a value as fixstr of 1 byte | TBT |
+| %c           | 1    | fixstr [1]     | Store a value as fixstr of 1 byte | |
 | %s           | 0..n | str            | store a value as string | Note 1 |
 | %S           |      |                | store a value as string, but the input is an unicode string | Note 2 |
 | %n           | 1    | nil            | Store a null pointer, regardless the value placed in variadic arguments | Note 3 |
@@ -38,13 +38,17 @@ Symbols and place-holder adopted internally for fmt syntax.
 | %hf          | 1+4  | bfloat16       | The input is a bfloat16 number, which will be converted into float and stored as float in msgpack | Note 4 |
 |              |      |                | The bfloat16 is mapped into a float number without rouding |
 | %f           | 1+4  | float32        | Store a float value | TBT |
-| %he          | 1+4  | float32        | The input is a float16 number, which will be converted into float and stored as float in msgpack | TBI |
-| %e           | 1+8  | float64        | Store a double value | TBT |
-| %i           | 1..9 | int8..int64    | Store an integer value, from 8 bit to 64bit | TBT |
-| %u           | 1..9 | UINT8..UINT64  | Store an unsigned integer value, from 8 to 64 bit. | TBT |
-| %!           | 1..n |                | A place holder used to fill an object through a callback function | TBT |
+| %he          | 1+4  | float32        | The input is a float16 number, which will be converted into float and stored as float in msgpack | |
+| %e           | 1+8  | float64        | Store a double value | |
+| %i           | 1..9 | int8..int64    | Store an integer value, from 8 bit to 64bit | |
+| %u           | 1..9 | UINT8..UINT64  | Store an unsigned integer value, from 8 to 64 bit. | |
+| %!           | 1..n |                | A place holder used to fill an object through a callback function | |
 | null         | 1    | nil            | write nil as value | TBI |
 | key          | 1..n | fixstr...      | write a key as string | Note 5 |
+
+The placeholder '%!' is used in two different ways:
+1. Used inside an array, the callback will be called until doesn't return 0
+2. Used into an object, it will be called a single time
 
 Status definition:
 - TESTED
@@ -106,6 +110,14 @@ msgpack supports extensions in data serialization, but actually it's not possibl
 #include <msgpack.h>
 #include <stdio.h>
 
+static int r = 2;
+
+int callback_map(msgpack_packer* pk, void *opt)
+{
+    msgpack_sprintf(pk, "{nested: %i", r);
+    return r--;
+}
+
 int main(void)
 {
   msgpack_sbuffer sbuf;
@@ -114,10 +126,9 @@ int main(void)
   msgpack_packer pk;
   msgpack_packer_init(&pk, &sbuf, msgpack_sbuffer_write);
 
-  msgpack_sprintf(&pk, "{keyA: %s keyB: %i keyC: [%i %i] }",
-    "keyA value",
-    1,
-    2, 3);
+	msgpack_sprintf(&pk, "{int: %i, str:%s, array: [%i %i], float: %he, recursive: [%!], object: %!", 
+        5, "string", 1, 2, 3.1, callback_map, NULL,
+        callback_map, NULL);
 
   /* deserialize the buffer into msgpack_object instance. */
     /* deserialized object is valid during the msgpack_zone instance alive. */
@@ -140,10 +151,16 @@ int main(void)
 Excepted JSON value:
 ```json
 {
-  "keyA": "keyA value",
-  "keyB": 1,
-  "keyC": [
-    2, 3
-  ]
+  "int": 5,
+  "str": "string",
+  "array": [1, 2],
+  "float": -19.203125,
+  "recursive": [
+    {"nested": 2}, 
+    {"nested": 1}, 
+  ], 
+  "object":{
+    "nested": -1
+  }
 }
 ```
